@@ -133,33 +133,61 @@ def redact_pdf(input_path: Path, output_path: Path) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    input_dir = Path("input")
-    output_dir = Path("output")
-
+def process_all_pdfs(input_dir: Path, output_dir: Path, callback=None):
+    """
+    Redact all valid BSN numbers from every PDF in input_dir and save to output_dir.
+    If callback is provided, it will be called with strings to log progress.
+    Returns a tuple: (success_count, failure_count, grand_total_redactions, file_summaries)
+    """
     if not input_dir.exists():
-        sys.exit(f"'input' folder not found in {Path.cwd()}")
+        raise FileNotFoundError(f"'input' folder not found in {input_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pdf_files = sorted(input_dir.glob("*.pdf"))
     if not pdf_files:
-        print("No PDF files found in the 'input' folder.")
-        return
+        if callback:
+            callback("No PDF files found in the input folder.")
+        return 0, 0, 0, []
 
-    print(f"Found {len(pdf_files)} PDF file(s) to process.\n")
+    if callback:
+        callback(f"Found {len(pdf_files)} PDF file(s). Starting process...\n")
+
+    success_count = 0
+    failure_count = 0
+    grand_total_redactions = 0
+    file_summaries = []
 
     for pdf_path in pdf_files:
         out_name = "redacted_" + pdf_path.name
         out_path = output_dir / out_name
-        print(f"  Processing: {pdf_path.name} ...", end=" ", flush=True)
+
+        if callback:
+            callback(f"Processing: {pdf_path.name}...")
         try:
             count = redact_pdf(pdf_path, out_path)
-            print(f"{count} BSN(s) redacted → {out_path}")
+            if callback:
+                callback(f"  ✓ Success: {count} BSN(s) redacted.")
+            success_count += 1
+            grand_total_redactions += count
+            file_summaries.append(f"{pdf_path.name}: {count} redacted")
         except Exception as exc:
-            print(f"ERROR: {exc}")
+            if callback:
+                callback(f"  ✗ Error: {exc}")
+            failure_count += 1
+            file_summaries.append(f"{pdf_path.name}: FAILED")
 
-    print("\nDone.")
+    return success_count, failure_count, grand_total_redactions, file_summaries
+
+def main():
+    input_dir = Path("input")
+    output_dir = Path("output")
+
+    try:
+        success, fail, total, summaries = process_all_pdfs(input_dir, output_dir, callback=print)
+        print("\nDone.")
+    except Exception as e:
+        print(f"ERROR: {e}")
 
 
 if __name__ == "__main__":

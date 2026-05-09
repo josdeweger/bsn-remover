@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 from PyQt6.QtGui import QFont
 
-from main import redact_pdf
+from main import redact_pdf, process_all_pdfs
 
 class RedactionWorker(QObject):
     """
@@ -25,46 +25,23 @@ class RedactionWorker(QObject):
 
     def run(self):
         try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            pdf_files = sorted(self.input_dir.glob("*.pdf"))
+            # Call the decoupled logic from main.py
+            # We pass self.log_signal.emit as the callback to update the UI
+            success, fail, total, summaries = process_all_pdfs(
+                self.input_dir,
+                self.output_dir,
+                callback=self.log_signal.emit
+            )
 
-            if not pdf_files:
-                self.log_signal.emit("No PDF files found in the input folder.")
-                self.finished_signal.emit()
-                return
-
-            self.log_signal.emit(f"Found {len(pdf_files)} PDF file(s). Starting process...\n")
-
-            total_files = len(pdf_files)
-            success_count = 0
-            failure_count = 0
-            grand_total_redactions = 0
-            file_summaries = []
-
-            for pdf_path in pdf_files:
-                out_name = "redacted_" + pdf_path.name
-                out_path = self.output_dir / out_name
-
-                self.log_signal.emit(f"Processing: {pdf_path.name}...")
-                try:
-                    count = redact_pdf(pdf_path, out_path)
-                    self.log_signal.emit(f"  ✓ Success: {count} BSN(s) redacted.")
-                    success_count += 1
-                    grand_total_redactions += count
-                    file_summaries.append(f"{pdf_path.name}: {count} redacted")
-                except Exception as e:
-                    self.log_signal.emit(f"  ✗ Error: {str(e)}")
-                    failure_count += 1
-                    file_summaries.append(f"{pdf_path.name}: FAILED")
-
-            # Final Summary
+            # Construct the final summary a la the original GUI implementation
+            total_files = success + fail
             summary = "\n" + "="*30 + "\nFINAL SUMMARY\n" + "="*30 + "\n"
             summary += f"Total PDFs processed: {total_files}\n"
-            summary += f"Successfully redacted: {success_count}\n"
-            summary += f"Failures: {failure_count}\n"
-            summary += f"Total redactions made: {grand_total_redactions}\n\n"
+            summary += f"Successfully redacted: {success}\n"
+            summary += f"Failures: {fail}\n"
+            summary += f"Total redactions made: {total}\n\n"
             summary += "Details per file:\n"
-            summary += "\n".join(file_summaries)
+            summary += "\n".join(summaries)
             summary += "\n" + "="*30 + "\n\nDone."
 
             self.log_signal.emit(summary)
