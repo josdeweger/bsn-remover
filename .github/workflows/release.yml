@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+  actions: write
+  statuses: write
+
 jobs:
   test:
     name: Run Tests (Ubuntu)

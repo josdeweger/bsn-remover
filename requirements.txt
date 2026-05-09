@@ -1,0 +1,4 @@
+pymupdf
+pyqt6
+pytesseract
+Pillow
