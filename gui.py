@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 from PyQt6.QtGui import QFont
 
-from main import redact_pdf, process_all_pdfs
+from main import redact_pdf, process_all_files
 
 class RedactionWorker(QObject):
     """
@@ -27,16 +27,16 @@ class RedactionWorker(QObject):
         try:
             # Call the decoupled logic from main.py
             # We pass self.log_signal.emit as the callback to update the UI
-            success, fail, total, summaries = process_all_pdfs(
+            success, fail, total, summaries = process_all_files(
                 self.input_dir,
                 self.output_dir,
                 callback=self.log_signal.emit
             )
 
-            # Construct the final summary a la the original GUI implementation
+            # Construct the final summary
             total_files = success + fail
             summary = "\n" + "="*30 + "\nFINAL SUMMARY\n" + "="*30 + "\n"
-            summary += f"Total PDFs processed: {total_files}\n"
+            summary += f"Total files processed: {total_files}\n"
             summary += f"Successfully redacted: {success}\n"
             summary += f"Failures: {fail}\n"
             summary += f"Total redactions made: {total}\n\n"

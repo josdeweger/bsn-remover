@@ -23,6 +23,15 @@ except ImportError:
         "PyMuPDF is not installed. Run:  pip install pymupdf"
     )
 
+try:
+    import pytesseract
+    from PIL import Image, ImageDraw
+except ImportError:
+    # We don't sys.exit here because we want the text-based redaction to still work
+    pytesseract = None
+    Image = None
+    ImageDraw = None
+
 
 # ---------------------------------------------------------------------------
 # BSN validation
@@ -75,8 +84,101 @@ def extract_bsn_candidates(text: str):
 
 
 # ---------------------------------------------------------------------------
+# Image redaction (OCR)
+# ---------------------------------------------------------------------------
+
+def redact_image(input_path_or_img, output_path: Path = None) -> tuple[int, Image.Image]:
+    """
+    Perform OCR on image, redact BSNs.
+    If input_path_or_img is a Path, it loads the image and saves to output_path.
+    If it's an Image object, it returns the modified image.
+    Returns (number_of_redactions, image).
+    """
+    if pytesseract is None or Image is None:
+        raise RuntimeError("OCR dependencies (pytesseract, Pillow) are not installed.")
+
+    # Ensure Tesseract is installed on system
+    try:
+        pytesseract.get_tesseract_version()
+    except (pytesseract.TesseractNotFoundError, Exception):
+        raise RuntimeError("Tesseract OCR engine not found on system. Please install Tesseract.")
+
+    if isinstance(input_path_or_img, Path):
+        img = Image.open(input_path_or_img).convert("RGB")
+    else:
+        img = input_path_or_img.convert("RGB")
+
+    draw = ImageDraw.Draw(img)
+
+    # Get OCR data: contains text and bounding boxes
+    ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.LIST)
+
+    # Filter for actual words (level 5 in Tesseract output)
+    words = [d for d in ocr_data if int(d['level']) == 5]
+
+    if not words:
+        if output_path:
+            img.save(output_path)
+        return 0, img
+
+    # Reconstruct full text and a mapping from character index to word index
+    full_text = ""
+    char_to_word = []
+
+    for i, w in enumerate(words):
+        word_text = w['text']
+        for _ in range(len(word_text)):
+            char_to_word.append(i)
+        full_text += word_text + " "
+        char_to_word.append(i) # The space
+
+    total_redactions = 0
+    for start, end, raw in extract_bsn_candidates(full_text):
+        word_start_idx = char_to_word[min(start, len(char_to_word)-1)]
+        word_end_idx = char_to_word[min(end-1, len(char_to_word)-1)]
+
+        for i in range(word_start_idx, word_end_idx + 1):
+            w = words[i]
+            box = [int(w['left']), int(w['top']), int(w['left']) + int(w['width']), int(w['top']) + int(w['height'])]
+            draw.rectangle(box, fill="black", outline="black")
+            total_redactions += 1
+
+    if output_path:
+        img.save(output_path)
+    return total_redactions, img
+
+
+# ---------------------------------------------------------------------------
 # PDF redaction
 # ---------------------------------------------------------------------------
+
+def redact_pdf_ocr(input_path: Path, output_path: Path) -> int:
+    """
+    Renders PDF pages as images, redacts them via OCR, and saves as a new PDF.
+    """
+    doc = fitz.open(str(input_path))
+    redacted_images = []
+    total_redactions = 0
+
+    for page in doc:
+        # Render page to image (high res for OCR)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        count, redacted_img = redact_image(img)
+        redacted_images.append(redacted_img)
+        total_redactions += count
+
+    # Convert list of images back to PDF
+    if redacted_images:
+        # Save as a PDF
+        # Only the first image needs to be converted to PDF, then others appended
+        pdf_img = redacted_images[0]
+        pdf_img.save(output_path, save_all=True, append_images=redacted_images[1:])
+
+    doc.close()
+    return total_redactions
+
 
 def redact_pdf(input_path: Path, output_path: Path) -> int:
     """
@@ -85,16 +187,16 @@ def redact_pdf(input_path: Path, output_path: Path) -> int:
     """
     doc = fitz.open(str(input_path))
     total_redactions = 0
+    has_text = False
 
     for page in doc:
-        # Use "words" instead of "rawdict" for more stable bounding boxes.
-        # get_text("words") returns (x0, y0, x1, y1, "word", block_no, line_no, word_no)
         words = page.get_text("words")
+        if words:
+            has_text = True
 
         if not words:
             continue
 
-        # Build the full text and a mapping from character index to word index
         full_text = ""
         char_to_word = []
 
@@ -106,36 +208,45 @@ def redact_pdf(input_path: Path, output_path: Path) -> int:
             char_to_word.append(i) # The space
 
         for start, end, raw in extract_bsn_candidates(full_text):
-            # Identify which words overlap with the match
-            # We clamp indices to avoid out-of-bounds
             word_start_idx = char_to_word[min(start, len(char_to_word)-1)]
             word_end_idx = char_to_word[min(end-1, len(char_to_word)-1)]
 
-            # Redact each word in the range
             for i in range(word_start_idx, word_end_idx + 1):
                 w = words[i]
                 rect = fitz.Rect(w[0], w[1], w[2], w[3])
-
-                # Add a small vertical padding
                 rect = rect + (-1, -2, 1, 2)
-
                 page.add_redact_annot(rect, fill=(0, 0, 0))
                 total_redactions += 1
 
         page.apply_redactions()
 
-    doc.save(str(output_path), garbage=4, deflate=True)
+    if total_redactions > 0:
+        doc.save(str(output_path), garbage=4, deflate=True)
+        doc.close()
+        return total_redactions
+
     doc.close()
-    return total_redactions
+
+    # Fallback: if no redactions were made and there's no embedded text, try OCR
+    if not has_text:
+        return redact_pdf_ocr(input_path, output_path)
+
+    # If it has text but no BSNs, we still save a copy to maintain consistency
+    # (though in a real app we might just skip it).
+    # But let's just save the original to the output path if we didn't redact.
+    # We use a simple copy.
+    import shutil
+    shutil.copy(input_path, output_path)
+    return 0
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def process_all_pdfs(input_dir: Path, output_dir: Path, callback=None):
+def process_all_files(input_dir: Path, output_dir: Path, callback=None):
     """
-    Redact all valid BSN numbers from every PDF in input_dir and save to output_dir.
+    Redact all valid BSN numbers from every PDF and image in input_dir and save to output_dir.
     If callback is provided, it will be called with strings to log progress.
     Returns a tuple: (success_count, failure_count, grand_total_redactions, file_summaries)
     """
@@ -144,38 +255,49 @@ def process_all_pdfs(input_dir: Path, output_dir: Path, callback=None):
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    pdf_files = sorted(input_dir.glob("*.pdf"))
-    if not pdf_files:
+    # Support PDFs and common image formats
+    extensions = ("*.pdf", "*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tiff")
+    all_files = []
+    for ext in extensions:
+        all_files.extend(input_dir.glob(ext))
+
+    all_files = sorted(all_files, key=lambda x: x.name.lower())
+
+    if not all_files:
         if callback:
-            callback("No PDF files found in the input folder.")
+            callback("No supported files found in the input folder.")
         return 0, 0, 0, []
 
     if callback:
-        callback(f"Found {len(pdf_files)} PDF file(s). Starting process...\n")
+        callback(f"Found {len(all_files)} file(s). Starting process...\n")
 
     success_count = 0
     failure_count = 0
     grand_total_redactions = 0
     file_summaries = []
 
-    for pdf_path in pdf_files:
-        out_name = "redacted_" + pdf_path.name
+    for file_path in all_files:
+        out_name = "redacted_" + file_path.name
         out_path = output_dir / out_name
 
         if callback:
-            callback(f"Processing: {pdf_path.name}...")
+            callback(f"Processing: {file_path.name}...")
         try:
-            count = redact_pdf(pdf_path, out_path)
+            if file_path.suffix.lower() == ".pdf":
+                count = redact_pdf(file_path, out_path)
+            else:
+                count = redact_image(file_path, out_path)[0]
+
             if callback:
                 callback(f"  ✓ Success: {count} BSN(s) redacted.")
             success_count += 1
             grand_total_redactions += count
-            file_summaries.append(f"{pdf_path.name}: {count} redacted")
+            file_summaries.append(f"{file_path.name}: {count} redacted")
         except Exception as exc:
             if callback:
                 callback(f"  ✗ Error: {exc}")
             failure_count += 1
-            file_summaries.append(f"{pdf_path.name}: FAILED")
+            file_summaries.append(f"{file_path.name}: FAILED")
 
     return success_count, failure_count, grand_total_redactions, file_summaries
 
@@ -184,7 +306,7 @@ def main():
     output_dir = Path("output")
 
     try:
-        success, fail, total, summaries = process_all_pdfs(input_dir, output_dir, callback=print)
+        success, fail, total, summaries = process_all_files(input_dir, output_dir, callback=print)
         print("\nDone.")
     except Exception as e:
         print(f"ERROR: {e}")
